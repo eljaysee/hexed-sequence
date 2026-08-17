@@ -31,6 +31,7 @@ const DEFAULT_VELOCITY: Record<TrackId, number> = {
   pad: 70,
   bass: 95,
   arp: 85,
+  synth: 62,
   drums: 100,
 };
 
