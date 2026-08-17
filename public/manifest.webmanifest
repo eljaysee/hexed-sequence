@@ -1,0 +1,17 @@
+{
+  "name": "Hexed Sequence",
+  "short_name": "Hexed",
+  "description": "Black metal / trap / witch house MIDI generator",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0d1016",
+  "theme_color": "#0d1016",
+  "icons": [
+    {
+      "src": "./logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
