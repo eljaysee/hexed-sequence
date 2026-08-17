@@ -1,8 +1,20 @@
 // Lo-fi Web Audio synth engine for Hexed Sequence.
 // Voice oscillators -> ScriptProcessor bitcrusher -> WaveShaper distortion ->
 // BiquadFilter low-pass -> master gain -> destination.
+//
+// Scheduling model: rather than flattening the loop into a one-shot sorted
+// queue at start() time, the engine keeps a live reference to `loop` and a
+// continuous tick clock (anchorTime/anchorTick, rebased on tempo changes).
+// Every lookahead poll re-reads `this.loop.notes` directly, so edits made in
+// the piano roll (or a live BPM change) take effect on the very next poll —
+// no stop/restart required. See setLoop() and setBpm().
 
 import { DRUM_NOTES, PPQ, midiToFreq, type Loop, type TrackId } from "./music";
+
+/** How far ahead of "now" we schedule audio-thread events, in seconds. */
+const LOOKAHEAD = 0.2;
+/** How often we poll to top up the lookahead window, in ms. */
+const POLL_MS = 25;
 
 export interface FxParams {
   /** Distortion drive, 0..1. */
@@ -44,14 +56,6 @@ export const DEFAULT_TRACK_MIX: Record<TrackId, TrackMixState> = {
   drums: { mute: false, solo: false, gain: 1 },
 };
 
-interface ScheduledNote {
-  time: number; // seconds within the loop
-  track: TrackId;
-  midi: number;
-  velocity: number;
-  duration: number; // seconds
-}
-
 interface Voice {
   gain: GainNode;
   oscs: (OscillatorNode | AudioBufferSourceNode)[];
@@ -86,10 +90,15 @@ export class AudioEngine {
   private analyser: AnalyserNode | null = null;
   private noiseBuffer: AudioBuffer | null = null;
 
-  private queue: ScheduledNote[] = [];
-  private nextIndex = 0;
-  private startTime = 0;
-  private loopDuration = 0;
+  /** Live reference to the pattern being played; swapped in place by setLoop(). */
+  private loop: Loop | null = null;
+  private bpm = 140;
+  /** Tick-clock anchor: tick `anchorTick` occurs at AudioContext time `anchorTime`.
+   *  Rebased (not reset) whenever tempo changes, so the clock stays continuous. */
+  private anchorTime = 0;
+  private anchorTick = 0;
+  /** Absolute (unwrapped) tick position scheduled up through, exclusive. */
+  private lastScheduledTick = 0;
   private timer: number | null = null;
   private voices: Voice[] = [];
   private fx: FxParams = DEFAULT_FX;
@@ -99,12 +108,28 @@ export class AudioEngine {
     return this.timer !== null;
   }
 
+  private get loopTicks(): number {
+    return this.loop ? this.loop.settings.bars * 4 * PPQ : 0;
+  }
+
+  private secondsPerTick(): number {
+    return 60 / this.bpm / PPQ;
+  }
+
+  private tickAtTime(time: number): number {
+    return this.anchorTick + (time - this.anchorTime) / this.secondsPerTick();
+  }
+
+  private timeAtTick(tick: number): number {
+    return this.anchorTime + (tick - this.anchorTick) * this.secondsPerTick();
+  }
+
   /** Position within the loop as a 0..1 fraction. */
   getProgress(): number {
-    if (this.timer === null || this.ctx === null || this.loopDuration <= 0) return 0;
-    const elapsed = this.ctx.currentTime - this.startTime;
-    if (elapsed < 0) return 0;
-    return Math.max(0, Math.min(1, (elapsed % this.loopDuration) / this.loopDuration));
+    if (this.timer === null || this.ctx === null || this.loopTicks <= 0) return 0;
+    const tick = this.tickAtTime(this.ctx.currentTime);
+    const pos = ((tick % this.loopTicks) + this.loopTicks) % this.loopTicks;
+    return pos / this.loopTicks;
   }
 
   async start(loop: Loop, bpm: number, fx: FxParams): Promise<void> {
@@ -116,28 +141,12 @@ export class AudioEngine {
     this.fx = { ...fx };
     this.applyFx();
 
-    const secondsPerTick = 60 / bpm / PPQ;
-    const queue: ScheduledNote[] = [];
-    (Object.keys(loop.notes) as TrackId[]).forEach((track) => {
-      for (const n of loop.notes[track]) {
-        queue.push({
-          time: n.start * secondsPerTick,
-          track,
-          midi: n.midi,
-          velocity: n.velocity,
-          duration: n.duration * secondsPerTick,
-        });
-      }
-    });
-    queue.sort((a, b) => a.time - b.time);
-
-    this.queue = queue;
-    // Keep the transport locked to the musical grid, not the last note's release.
-    // This prevents long pad tails from stretching the loop/playhead.
-    this.loopDuration = (loop.settings.bars * 4 * PPQ) * secondsPerTick;
-    this.nextIndex = 0;
-    this.startTime = ctx.currentTime + 0.08;
-    this.timer = window.setInterval(() => this.schedule(), 25);
+    this.loop = loop;
+    this.bpm = bpm;
+    this.anchorTime = ctx.currentTime + 0.08;
+    this.anchorTick = 0;
+    this.lastScheduledTick = 0;
+    this.timer = window.setInterval(() => this.schedule(), POLL_MS);
     this.schedule();
   }
 
@@ -176,6 +185,36 @@ export class AudioEngine {
   /** Update mute/solo/gain per track. Takes effect on the next scheduled hits — no restart needed. */
   updateTrackMix(mix: Record<TrackId, TrackMixState>): void {
     this.trackMix = mix;
+  }
+
+  /**
+   * Hot-swap the pattern being played. The tick clock keeps running untouched —
+   * the very next lookahead poll reads notes out of the new `loop` — so edits
+   * made in the piano roll (add/remove/retune a note, mutate, invert) show up
+   * live without stopping playback. Notes at or before the current playhead
+   * position in this cycle simply won't retroactively fire; they'll play on
+   * the next pass. If `loop.settings.bars`/`resolution` changed the cycle
+   * length mid-bar, the wrap point adopts the new length immediately, which
+   * can shorten or lengthen the *current* pass slightly — a minor, rare edge
+   * case rather than a glitch.
+   */
+  setLoop(loop: Loop): void {
+    this.loop = loop;
+  }
+
+  /**
+   * Hot-change tempo. Rebases the tick/time anchor to "now" using the tempo
+   * that was in effect a moment ago, then switches to the new tempo going
+   * forward — so the playhead doesn't jump, it just speeds up or slows down
+   * from exactly where it was.
+   */
+  setBpm(bpm: number): void {
+    if (this.ctx && this.timer !== null) {
+      const now = this.ctx.currentTime;
+      this.anchorTick = this.tickAtTime(now);
+      this.anchorTime = now;
+    }
+    this.bpm = bpm;
   }
 
   private ensureGraph(): void {
@@ -271,32 +310,42 @@ export class AudioEngine {
   }
 
   private schedule(): void {
-    if (!this.ctx || this.timer === null) return;
-    const horizon = this.ctx.currentTime + 0.2;
+    if (!this.ctx || this.timer === null || !this.loop) return;
+    const loopTicks = this.loopTicks;
+    if (loopTicks <= 0) return;
+
+    const horizonTick = this.tickAtTime(this.ctx.currentTime + LOOKAHEAD);
+    if (horizonTick <= this.lastScheduledTick) return;
+
     const anySolo = (Object.keys(this.trackMix) as TrackId[]).some(
       (t) => this.trackMix[t].solo,
     );
+    const spt = this.secondsPerTick();
+    const lastScheduledTick = this.lastScheduledTick;
 
-    while (this.nextIndex < this.queue.length) {
-      const n = this.queue[this.nextIndex];
-      const t = this.startTime + n.time;
-      if (t > horizon) break;
-      const mix = this.trackMix[n.track];
+    (Object.keys(this.loop.notes) as TrackId[]).forEach((track) => {
+      const mix = this.trackMix[track];
       const audible = mix ? !mix.mute && (!anySolo || mix.solo) : true;
-      if (audible) {
-        const gainMul = mix ? mix.gain : 1;
-        this.trigger(n.track, n.midi, n.velocity, t, n.duration, gainMul);
-      }
-      this.nextIndex++;
-    }
+      if (!audible) return;
+      const gainMul = mix ? mix.gain : 1;
 
-    if (this.nextIndex >= this.queue.length) {
-      const loopEnd = this.startTime + this.loopDuration;
-      if (loopEnd < this.ctx.currentTime + 0.3) {
-        this.nextIndex = 0;
-        this.startTime = Math.max(loopEnd, this.ctx.currentTime + 0.06);
+      for (const n of this.loop!.notes[track]) {
+        // A note at tick `n.start` repeats every `loopTicks`; find every
+        // repetition that falls within (lastScheduledTick, horizonTick].
+        let k = Math.floor((lastScheduledTick - n.start) / loopTicks);
+        for (;;) {
+          const absTick = n.start + k * loopTicks;
+          if (absTick > horizonTick) break;
+          if (absTick > lastScheduledTick) {
+            const when = this.timeAtTick(absTick);
+            this.trigger(track, n.midi, n.velocity, when, n.duration * spt, gainMul);
+          }
+          k++;
+        }
       }
-    }
+    });
+
+    this.lastScheduledTick = horizonTick;
   }
 
   private trigger(

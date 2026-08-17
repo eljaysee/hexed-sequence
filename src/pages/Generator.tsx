@@ -103,6 +103,20 @@ export default function Generator() {
   }, [engine, trackMix]);
   useEffect(() => () => engine.stop(), [engine]);
 
+  // Keep the audio engine's live pattern in sync with every edit (piano roll,
+  // mutate, invert, summon, recall) — no restart needed. Harmless when
+  // stopped; start() also passes the loop explicitly for the very first hit.
+  useEffect(() => {
+    engine.setLoop(loop);
+  }, [engine, loop]);
+
+  // BPM is intentionally excluded from generationDiffers (see above) so it's
+  // always "live" — push it straight to the engine's tick clock, which
+  // rebases smoothly rather than jumping.
+  useEffect(() => {
+    engine.setBpm(settings.bpm);
+  }, [engine, settings.bpm]);
+
   // Playhead animation.
   useEffect(() => {
     if (!playing) return;
@@ -153,22 +167,20 @@ export default function Generator() {
   }, [settings, stopPlayback, confirmDiscardEdits]);
 
   const mutate = useCallback(() => {
-    stopPlayback();
     setLoop((l) => {
       setUndoStack((stack) => [...stack.slice(-(MAX_UNDO - 1)), l]);
       setNotesEdited(true);
       return mutateLoop(l);
     });
-  }, [stopPlayback]);
+  }, []);
 
   const invert = useCallback(() => {
-    stopPlayback();
     setLoop((l) => {
       setUndoStack((stack) => [...stack.slice(-(MAX_UNDO - 1)), l]);
       setNotesEdited(true);
       return invertLoop(l);
     });
-  }, [stopPlayback]);
+  }, []);
 
   /** Piano-roll edits (add/remove/retune a note) push the prior state onto the undo stack. */
   const editLoop = useCallback(
